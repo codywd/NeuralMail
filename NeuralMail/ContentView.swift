@@ -6,54 +6,72 @@
 //
 
 import SwiftUI
-import SwiftData
 
 struct ContentView: View {
-    @Environment(\.modelContext) private var modelContext
-    @Query private var items: [Item]
+    @EnvironmentObject private var appStore: AppStore
+    @State private var selectedAccountID: UUID?
+    @StateObject private var inboxModel = InboxViewModel()
+    @State private var showingAddAccount = false
 
     var body: some View {
         NavigationSplitView {
-            List {
-                ForEach(items) { item in
-                    NavigationLink {
-                        Text("Item at \(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))")
-                    } label: {
-                        Text(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))
+            List(selection: $selectedAccountID) {
+                Section("Accounts") {
+                    ForEach(appStore.accounts) { account in
+                        Text(account.displayName.isEmpty ? account.emailAddress : account.displayName)
+                            .tag(account.id)
                     }
+                    .onDelete(perform: deleteAccounts)
                 }
-                .onDelete(perform: deleteItems)
             }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200)
+            .navigationSplitViewColumnWidth(min: 220, ideal: 260)
             .toolbar {
-                ToolbarItem {
-                    Button(action: addItem) {
-                        Label("Add Item", systemImage: "plus")
+                ToolbarItemGroup {
+                    Button {
+                        showingAddAccount = true
+                    } label: {
+                        Label("Add Account", systemImage: "plus")
                     }
+
+                    Button {
+                        Task { await inboxModel.refreshSelected() }
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(inboxModel.selectedAccount == nil)
                 }
             }
+        } content: {
+            ThreadListView(model: inboxModel)
         } detail: {
-            Text("Select an item")
+            MessageDetailView(model: inboxModel)
         }
-    }
-
-    private func addItem() {
-        withAnimation {
-            let newItem = Item(timestamp: Date())
-            modelContext.insert(newItem)
+        .sheet(isPresented: $showingAddAccount) {
+            AddAccountSheet()
+                .environmentObject(appStore)
         }
-    }
-
-    private func deleteItems(offsets: IndexSet) {
-        withAnimation {
-            for index in offsets {
-                modelContext.delete(items[index])
+        .onAppear {
+            if selectedAccountID == nil {
+                selectedAccountID = appStore.accounts.first?.id
             }
+        }
+        .onChange(of: selectedAccountID) { newValue in
+            let selected = appStore.accounts.first(where: { $0.id == newValue })
+            inboxModel.selectAccount(selected)
+        }
+    }
+
+    private func deleteAccounts(offsets: IndexSet) {
+        appStore.deleteAccounts(offsets: offsets)
+        if let selectedAccountID, !appStore.accounts.contains(where: { $0.id == selectedAccountID }) {
+            self.selectedAccountID = appStore.accounts.first?.id
         }
     }
 }
 
-#Preview {
-    ContentView()
-        .modelContainer(for: Item.self, inMemory: true)
+struct ContentView_Previews: PreviewProvider {
+    static var previews: some View {
+        ContentView()
+            .environmentObject(AppStore.preview)
+    }
 }
