@@ -8,12 +8,20 @@ final class AppStore: ObservableObject {
 
     private let accountsKey = "NeuralMail.accounts.v1"
     private let aiProfilesKey = "NeuralMail.aiProfiles.v1"
+    private let mailboxCachesKey = "NeuralMail.mailboxCaches.v1"
+
+    private var mailboxCaches: [MailboxCacheKey: MailboxCache] = [:]
 
     init(loadFromDefaults: Bool = true) {
         guard loadFromDefaults else { return }
         accounts = Self.load([NMAccount].self, key: accountsKey) ?? []
         aiProfiles = Self.load([NMAIProfile].self, key: aiProfilesKey) ?? []
         accounts.sort(by: Self.accountSort)
+        if let caches = Self.load([MailboxCache].self, key: mailboxCachesKey) {
+            mailboxCaches = Dictionary(uniqueKeysWithValues: caches.map { cache in
+                (MailboxCacheKey(accountID: cache.accountID, mailbox: cache.mailbox), cache)
+            })
+        }
     }
 
     func addAccount(_ account: NMAccount) {
@@ -26,6 +34,7 @@ final class AppStore: ObservableObject {
         for index in offsets {
             let account = accounts[index]
             try? KeychainStore.delete(key: account.passwordKeychainKey)
+            deleteAllMailboxCaches(accountID: account.id)
         }
         for index in offsets.sorted(by: >) {
             accounts.remove(at: index)
@@ -48,6 +57,15 @@ final class AppStore: ObservableObject {
 
     private func persistAIProfiles() {
         Self.save(aiProfiles, key: aiProfilesKey)
+    }
+
+    private func persistMailboxCaches() {
+        Self.save(Array(mailboxCaches.values), key: mailboxCachesKey)
+    }
+
+    private func deleteAllMailboxCaches(accountID: UUID) {
+        mailboxCaches = mailboxCaches.filter { $0.key.accountID != accountID }
+        persistMailboxCaches()
     }
 
     private static func accountSort(_ a: NMAccount, _ b: NMAccount) -> Bool {
@@ -82,5 +100,21 @@ extension AppStore {
             ),
         ]
         return store
+    }
+}
+
+extension AppStore: MailboxCacheStore {
+    func loadMailboxCache(accountID: UUID, mailbox: String) -> MailboxCache? {
+        mailboxCaches[MailboxCacheKey(accountID: accountID, mailbox: mailbox)]
+    }
+
+    func saveMailboxCache(_ cache: MailboxCache) {
+        mailboxCaches[MailboxCacheKey(accountID: cache.accountID, mailbox: cache.mailbox)] = cache
+        persistMailboxCaches()
+    }
+
+    func deleteMailboxCache(accountID: UUID, mailbox: String) {
+        mailboxCaches.removeValue(forKey: MailboxCacheKey(accountID: accountID, mailbox: mailbox))
+        persistMailboxCaches()
     }
 }

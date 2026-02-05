@@ -37,6 +37,22 @@ actor IMAPClient {
         _ = try await sendCommand("SELECT \(IMAPClient.quoteIMAPString(name))")
     }
 
+    func mailboxStatus(_ name: String) async throws -> IMAPMailboxStatus {
+        let response = try await sendCommand("STATUS \(IMAPClient.quoteIMAPString(name)) (UIDNEXT UIDVALIDITY)")
+        var status = IMAPMailboxStatus(uidValidity: nil, uidNext: nil)
+        for part in response {
+            guard case let .line(line) = part else { continue }
+            guard line.hasPrefix("* STATUS") else { continue }
+            if let uidValidity = IMAPClient.parseStatusValue(line: line, key: "UIDVALIDITY") {
+                status.uidValidity = uidValidity
+            }
+            if let uidNext = IMAPClient.parseStatusValue(line: line, key: "UIDNEXT") {
+                status.uidNext = uidNext
+            }
+        }
+        return status
+    }
+
     func uidSearchAll() async throws -> [UInt32] {
         let response = try await sendCommand("UID SEARCH ALL")
         let searchLines = response.compactMap { part -> String? in
@@ -48,11 +64,43 @@ actor IMAPClient {
         return pieces.compactMap { UInt32($0) }
     }
 
+    func uidSearchRange(start: UInt32, end: UInt32?) async throws -> [UInt32] {
+        let range = end == nil ? "\(start):*" : "\(start):\(end!)"
+        let response = try await sendCommand("UID SEARCH \(range)")
+        let searchLines = response.compactMap { part -> String? in
+            if case let .line(line) = part, line.hasPrefix("* SEARCH") { return line }
+            return nil
+        }
+        guard let line = searchLines.last else { return [] }
+        let pieces = line.split(separator: " ").dropFirst(2)
+        return pieces.compactMap { UInt32($0) }
+    }
+
+    func listMailboxes() async throws -> [String] {
+        let response = try await sendCommand("LIST \"\" \"*\"")
+        var names: [String] = []
+        for part in response {
+            guard case let .line(line) = part else { continue }
+            guard line.hasPrefix("* LIST") else { continue }
+            if let name = IMAPClient.parseMailboxName(from: line) {
+                names.append(name)
+            }
+        }
+        return Array(Set(names)).sorted()
+    }
+
     func fetchHeaders(uids: [UInt32]) async throws -> [UInt32: IMAPParsedHeaders] {
         guard !uids.isEmpty else { return [:] }
         let set = uids.map(String.init).joined(separator: ",")
         let response = try await sendCommand("UID FETCH \(set) (UID BODY.PEEK[HEADER.FIELDS (DATE FROM SUBJECT)])")
         return try parseFetchHeaders(responseParts: response)
+    }
+
+    func fetchHeadersAndPreview(uids: [UInt32]) async throws -> [UInt32: IMAPFetchResult] {
+        guard !uids.isEmpty else { return [:] }
+        let set = uids.map(String.init).joined(separator: ",")
+        let response = try await sendCommand("UID FETCH \(set) (UID BODY.PEEK[HEADER.FIELDS (DATE FROM SUBJECT)] BODY.PEEK[TEXT]<0.2048>)")
+        return try parseFetchHeadersAndPreview(responseParts: response)
     }
 
     func fetchBodyText(uid: UInt32) async throws -> Data {
@@ -144,6 +192,55 @@ actor IMAPClient {
         throw IMAPError.unexpectedResponse
     }
 
+    private func parseFetchHeadersAndPreview(responseParts: [IMAPResponsePart]) throws -> [UInt32: IMAPFetchResult] {
+        struct Partial {
+            var headersData: Data?
+            var previewData: Data?
+        }
+
+        var results: [UInt32: Partial] = [:]
+        var currentUID: UInt32?
+        var i = 0
+
+        while i < responseParts.count {
+            guard case let .line(line) = responseParts[i] else {
+                i += 1
+                continue
+            }
+
+            if let uid = IMAPClient.parseUID(from: line) {
+                currentUID = uid
+            }
+
+            if let uid = currentUID, i + 1 < responseParts.count, case let .literal(data) = responseParts[i + 1] {
+                if line.contains("HEADER.FIELDS") {
+                    var entry = results[uid] ?? Partial()
+                    entry.headersData = data
+                    results[uid] = entry
+                    i += 2
+                    continue
+                }
+                if line.contains("BODY[TEXT]") || line.contains("BODY.PEEK[TEXT]") {
+                    var entry = results[uid] ?? Partial()
+                    entry.previewData = data
+                    results[uid] = entry
+                    i += 2
+                    continue
+                }
+            }
+
+            i += 1
+        }
+
+        var parsed: [UInt32: IMAPFetchResult] = [:]
+        for (uid, entry) in results {
+            guard let headersData = entry.headersData else { continue }
+            let headersText = String(data: headersData, encoding: .utf8) ?? String(data: headersData, encoding: .isoLatin1) ?? ""
+            parsed[uid] = IMAPFetchResult(headers: IMAPHeaderParser.parse(headersText), previewData: entry.previewData)
+        }
+        return parsed
+    }
+
     static func quoteIMAPString(_ value: String) -> String {
         var escaped = value
         escaped = escaped.replacingOccurrences(of: "\\", with: "\\\\")
@@ -165,6 +262,28 @@ actor IMAPClient {
         let numberEnd = line.index(before: line.endIndex)
         let number = line[numberStart..<numberEnd]
         return Int(number)
+    }
+
+    static func parseStatusValue(line: String, key: String) -> UInt32? {
+        guard let range = line.range(of: "\(key) ") else { return nil }
+        let remainder = line[range.upperBound...]
+        let digits = remainder.prefix { $0.isNumber }
+        return UInt32(digits)
+    }
+
+    static func parseMailboxName(from line: String) -> String? {
+        if let lastQuote = line.lastIndex(of: "\"") {
+            let start = line[..<lastQuote]
+            if let firstQuote = start.lastIndex(of: "\"") {
+                let nameStart = line.index(after: firstQuote)
+                let name = line[nameStart..<lastQuote]
+                return String(name)
+            }
+        }
+        // Fallback: last token
+        let parts = line.split(separator: " ")
+        guard let last = parts.last else { return nil }
+        return String(last.trimmingCharacters(in: CharacterSet(charactersIn: "\"")))
     }
 }
 
@@ -194,6 +313,16 @@ struct IMAPParsedHeaders: Sendable {
     let subject: String
     let from: String
     let date: Date?
+}
+
+struct IMAPMailboxStatus: Sendable {
+    var uidValidity: UInt32?
+    var uidNext: UInt32?
+}
+
+struct IMAPFetchResult: Sendable {
+    let headers: IMAPParsedHeaders
+    let previewData: Data?
 }
 
 enum IMAPHeaderParser {

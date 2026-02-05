@@ -51,6 +51,7 @@ struct ContentView: View {
                 .environmentObject(appStore)
         }
         .onAppear {
+            inboxModel.attachCacheStore(appStore)
             if selectedAccountID == nil {
                 selectedAccountID = appStore.accounts.first?.id
             }
